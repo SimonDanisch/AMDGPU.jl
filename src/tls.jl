@@ -108,6 +108,12 @@ Return value of the function `f`.
 """
 function stream!(f::Function, s::HIPStream)
     old_s = stream()
+    # `s` has to be MADE CURRENT, which this did not do: it saved the old
+    # stream, ran `f` on it, and restored what had never changed. Nothing
+    # raises, and the failure is silent in both directions — work goes to a
+    # stream the caller is not waiting on, so a `synchronize(s)` returns at once
+    # and whatever is timed around it reports a rate the hardware cannot reach.
+    stream!(s)
     return try
         f()
     finally

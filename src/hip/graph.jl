@@ -27,6 +27,45 @@ mutable struct HIPGraph
         return obj
     end
 
+    """
+        begincapture!(stream = AMDGPU.stream(); flags = hipStreamCaptureModeGlobal)
+
+    Put `stream` into capture mode: work submitted to it becomes graph nodes
+    instead of executing. Paired with [`endcapture!`](@ref).
+
+    The split form, which HIP itself has and [`capture`](@ref) wraps. A caller
+    whose "submit the work" step is not a function it can pass — a graph runtime
+    that opens a recording, is handed dispatches one at a time, and closes it —
+    cannot use the scoped one.
+    """
+    global function begincapture!(stream::HIPStream = AMDGPU.stream();
+                                  flags = hipStreamCaptureModeGlobal)
+        hipStreamBeginCapture(stream, flags)
+        return stream
+    end
+
+    """
+        endcapture!(stream = AMDGPU.stream()) -> HIPGraph or nothing
+
+    End the capture on `stream` and give back what it recorded, or `nothing` when
+    the capture was invalidated — which is what HIP answers if anything illegal
+    happened on the stream while it was capturing, a synchronise or a kernel that
+    still had to be compiled among them.
+
+    Ending is unconditional and the status is a RESULT rather than an exception:
+    a stream left capturing fails every later `hipStreamSynchronize` with
+    `hipErrorStreamCaptureUnsupported`, so a caller unwinding from an error needs
+    to be able to close the capture without a second throw.
+    """
+    global function endcapture!(stream::HIPStream = AMDGPU.stream())::Union{Nothing, HIPGraph}
+        handle_ref = Ref{hipGraph_t}()
+        st = unchecked_hipStreamEndCapture(stream, handle_ref)
+        st == hipSuccess || return nothing
+        obj = new(handle_ref[])
+        finalizer(hipGraphDestroy, obj)
+        return obj
+    end
+
     global function capture(f::Function; flags = hipStreamCaptureModeGlobal, throw_error::Bool = true)::Union{Nothing, HIPGraph}
         gc_state = GC.enable(false)
         stream = AMDGPU.stream()

@@ -534,6 +534,57 @@ for (fname, elty) in ((:rocblas_zher2,:ComplexF64),
     end
 end
 
+"""
+    gemmEx!(transA, transB, alpha, A, B, beta, C)
+
+`C = alpha * op(A) * op(B) + beta * C` for `Float16` operands, accumulating in
+**Float32**.
+
+This is what a half-precision GEMM means everywhere else — cuBLAS reaches
+`cublasGemmEx` with `CUBLAS_COMPUTE_32F`, and PyTorch's autocast policy assumes
+it — and it is not what `rocblas_hgemm` does. HGEMM accumulates in fp16, which
+on a 576-deep reduction of SAM 2.1's encoder is 22x less accurate: 0.0877 max
+error against an fp32 reference where this gets 0.0039, the same as a
+cooperative-matrix kernel accumulating in fp32.
+
+Speed is not the reason it exists but it is not a cost either: 42.7 TFLOP/s
+against `hgemm`'s 46.6 on a gfx1151, and against 0.67 for the
+`GPUArrays.generic_matmatmul!` fallback that `mul!` reached before
+`generic_matmatmul!` below learned about `Float16`.
+
+`rocblas_gemm_ex_64` rather than `rocblas_gemm_ex`, because the 64-bit form is
+the one wrapped here; the dimensions are `Int64` for that reason and not
+because anything needs them.
+"""
+function gemmEx!(
+    transA::Char, transB::Char, alpha::Number,
+    A::StridedROCVecOrMat{Float16}, B::StridedROCVecOrMat{Float16},
+    beta::Number, C::StridedROCVecOrMat{Float16},
+)
+    m = size(A, transA == 'N' ? 1 : 2)
+    k = size(A, transA == 'N' ? 2 : 1)
+    n = size(B, transB == 'N' ? 2 : 1)
+    if m != size(C, 1) || n != size(C, 2) || k != size(B, transB == 'N' ? 1 : 2)
+        throw(DimensionMismatch(""))
+    end
+    lda = max(1, stride(A, 2))
+    ldb = max(1, stride(B, 2))
+    ldc = max(1, stride(C, 2))
+    # Both scalars are fp32 because the COMPUTE type is: rocBLAS reads them
+    # through a `Ptr{Cvoid}` and interprets them as `compute_type`.
+    alpha_ref = Ref(Float32(alpha))
+    beta_ref = Ref(Float32(beta))
+    (; handle) = lib_state()
+    rocblas_gemm_ex_64(
+        handle, transA, transB, Int64(m), Int64(n), Int64(k), alpha_ref,
+        A, rocblas_datatype_f16_r, Int64(lda),
+        B, rocblas_datatype_f16_r, Int64(ldb), beta_ref,
+        C, rocblas_datatype_f16_r, Int64(ldc),
+        C, rocblas_datatype_f16_r, Int64(ldc),
+        rocblas_datatype_f32_r, rocblas_gemm_algo_standard, Int32(0), UInt32(0))
+    return C
+end
+
 # Level 3
 ## (GE) general matrix-matrix multiplication
 for (fname, elty) in (
