@@ -141,8 +141,14 @@ end
 
 # Shared memory.
 
-@device_override @inline function KI.localmemory(::Type{T}, ::Val{Dims}) where {T, Dims}
-    ptr = AMDGPU.Device.alloc_special(Val(:shmem), T, Val(AMDGPU.AS.Local), Val(prod(Dims)))
+# `Val(Id)` and not `Val(:shmem)`. `alloc_special` names its global
+# `alloc_special_$id`, so a constant id made every workgroup buffer in a kernel
+# the same buffer: two `KI.localmemory(Float32, (16, 16))` calls are one
+# generated function, one global, and a tiled kernel that stages two tiles gets
+# the second on top of the first. `KA.SharedMemory` above has always passed its
+# `@localmem` id here; this is the same fix on the KI side.
+@device_override @inline function KI.localmemory(::Type{T}, ::Val{Dims}, ::Val{Id}) where {T, Dims, Id}
+    ptr = AMDGPU.Device.alloc_special(Val(Id), T, Val(AMDGPU.AS.Local), Val(prod(Dims)))
     AMDGPU.ROCDeviceArray(Dims, ptr)
 end
 
