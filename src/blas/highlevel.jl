@@ -206,6 +206,19 @@ function LinearAlgebra.mul!(
     end
 
     T = eltype(C)
+    # `Float16` FIRST, and separately, because `ROCBLASFloat` does not include
+    # it: a half-precision `mul!` used to fall all the way through to
+    # `GPUArrays.generic_matmatmul!`, which accumulates in the element type and
+    # runs at 0.67 TFLOP/s where `gemmEx!` gets 42.7 — a factor of 64, with no
+    # warning. Routed here it is also more accurate than the `rocblas_hgemm`
+    # that adding `Float16` to `ROCBLASFloat` would have reached, because the
+    # accumulation is fp32. See `gemmEx!`.
+    if T === Float16 && eltype(A) === Float16 && eltype(B) === Float16 &&
+            all(in(('N', 'T', 'C')), (tA, tB)) &&
+            A isa StridedROCArray{Float16} && B isa StridedROCArray{Float16} &&
+            alpha isa Union{Bool, Real} && beta isa Union{Bool, Real}
+        return gemmEx!(tA, tB, alpha, A, B, beta, C)
+    end
     if T <: ROCBLASFloat && alpha isa Union{Bool, T} && beta isa Union{Bool, T}
         α, β = T(alpha), T(beta)
 
