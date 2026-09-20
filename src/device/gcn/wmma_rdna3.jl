@@ -12,7 +12,16 @@ export load_a, load_b, load_c, store_d, mma, fill_c
 import Core: LLVMPtr, VecElement
 import ...BFloat16s: BFloat16
 import ..Device: @device_function
-import ..activelane
+import ..workitemIdx
+
+# RDNA3 WMMA is a wave32 operation.  Derive its lane from the hardware workitem
+# id instead of `__ockl_activelane_u32`: that OCKL symbol is absent from the
+# gfx1151 device library, so otherwise an ordinary portable cooperative-matrix
+# kernel passes Julia inference and then fails GPUCompiler validation with an
+# unresolved external.  Every WMMA workgroup is a multiple of 32, making the
+# low five bits exactly the active lane within each wave.
+@inline wmma_lane() =
+    (unsafe_trunc(Int32, workitemIdx().x) - Int32(1)) & Int32(31)
 
 # WMMA tile dimensions (fixed for RDNA 3).
 const M, N, K = 16, 16, 16
@@ -127,7 +136,7 @@ Load matrix `A` (M×K) from memory and return the resulting fragment.
 - `RowMajor`: row-major storage, `ptr[row * stride + col]`
 """
 function load_a(ptr::LLVMPtr{T}, stride::Int32, ::Type{ColMajor}) where T <: Union{Float16, BFloat16}
-    lane = unsafe_trunc(Int32, activelane())
+    lane = wmma_lane()
     row = lane & Int32(15)
     data = ntuple(Val(16)) do col
         offset = (Int32(col - 1) * stride + row) * Int32(sizeof(T))
@@ -137,7 +146,7 @@ function load_a(ptr::LLVMPtr{T}, stride::Int32, ::Type{ColMajor}) where T <: Uni
 end
 
 function load_a(ptr::LLVMPtr{T}, stride::Int32, ::Type{RowMajor}) where T <: Union{Float16, BFloat16}
-    lane = unsafe_trunc(Int32, activelane())
+    lane = wmma_lane()
     row = lane & Int32(15)
     data = ntuple(Val(16)) do col
         offset = (row * stride + Int32(col - 1)) * Int32(sizeof(T))
@@ -156,7 +165,7 @@ Load matrix `B` (K×N) from memory and return the resulting fragment.
 - `RowMajor`: row-major storage, `ptr[row * stride + col]`
 """
 function load_b(ptr::LLVMPtr{T}, stride::Int32, ::Type{ColMajor}) where T <: Union{Float16, BFloat16}
-    lane = unsafe_trunc(Int32, activelane())
+    lane = wmma_lane()
     col = lane & Int32(15)
     base = ptr + col * stride * Int32(sizeof(T))
     data = ntuple(Val(16)) do row
@@ -166,7 +175,7 @@ function load_b(ptr::LLVMPtr{T}, stride::Int32, ::Type{ColMajor}) where T <: Uni
 end
 
 function load_b(ptr::LLVMPtr{T}, stride::Int32, ::Type{RowMajor}) where T <: Union{Float16, BFloat16}
-    lane = unsafe_trunc(Int32, activelane())
+    lane = wmma_lane()
     col = lane & Int32(15)
     data = ntuple(Val(16)) do row
         offset = (Int32(row - 1) * stride + col) * Int32(sizeof(T))
@@ -187,7 +196,7 @@ widened to `Float32` on load.
 - `RowMajor`: row-major storage, `ptr[row * stride + col]`
 """
 function load_c(ptr::LLVMPtr{T}, stride::Int32, ::Type{ColMajor})::FragmentC_F32 where T <: Union{Float32, Float16, BFloat16}
-    lane = unsafe_trunc(Int32, activelane())
+    lane = wmma_lane()
     col = lane & Int32(15)
     half = lane >> 4
     data = ntuple(Val(8)) do k
@@ -199,7 +208,7 @@ function load_c(ptr::LLVMPtr{T}, stride::Int32, ::Type{ColMajor})::FragmentC_F32
 end
 
 function load_c(ptr::LLVMPtr{T}, stride::Int32, ::Type{RowMajor})::FragmentC_F32 where T <: Union{Float32, Float16, BFloat16}
-    lane = unsafe_trunc(Int32, activelane())
+    lane = wmma_lane()
     col = lane & Int32(15)
     half = lane >> 4
     data = ntuple(Val(8)) do k
@@ -225,7 +234,7 @@ narrowed from `Float32` on store.
 - `layout`: `ColMajor` (default) or `RowMajor`.
 """
 function store_d(ptr::LLVMPtr{T}, frag::FragmentC_F32, stride::Int32, ::Type{ColMajor}) where T <: Union{Float32, Float16, BFloat16}
-    lane = unsafe_trunc(Int32, activelane())
+    lane = wmma_lane()
     col = lane & Int32(15)
     half = lane >> 4
     for k in 1:8
@@ -237,7 +246,7 @@ function store_d(ptr::LLVMPtr{T}, frag::FragmentC_F32, stride::Int32, ::Type{Col
 end
 
 function store_d(ptr::LLVMPtr{T}, frag::FragmentC_F32, stride::Int32, ::Type{RowMajor}) where T <: Union{Float32, Float16, BFloat16}
-    lane = unsafe_trunc(Int32, activelane())
+    lane = wmma_lane()
     col = lane & Int32(15)
     half = lane >> 4
     for k in 1:8
