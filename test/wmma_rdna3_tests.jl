@@ -3,6 +3,7 @@ using AMDGPU
 using AMDGPU: ROCArray, @roc
 using BFloat16s
 using AMDGPU.Device: WMMA_RDNA3, workitemIdx, workgroupIdx
+import KernelInterface as KI
 
 AMDGPU.allowscalar(false)
 
@@ -58,7 +59,80 @@ else
         return
     end
 
+    function ki_coopmat_kernel!(C, A, B)
+        MA = KI.CoopMatrix{Float16,16,16,KI.MatrixA,KI.SubgroupScope}
+        MB = KI.CoopMatrix{Float16,16,16,KI.MatrixB,KI.SubgroupScope}
+        MC = KI.CoopMatrix{Float32,16,16,KI.Accumulator,KI.SubgroupScope}
+
+        # This is the path fused kernels actually use: stage through local
+        # memory, whose backend-neutral spelling becomes a ROCDeviceArray over
+        # an addrspace(3) pointer on AMDGPU.
+        sa = KI.localmemory(Float16, Val((256,)), Val(:ki_coopmat_a))
+        sb = KI.localmemory(Float16, Val((256,)), Val(:ki_coopmat_b))
+        lane = Int(workitemIdx().x)
+        for i in lane:32:256
+            sa[i] = A[i]
+            sb[i] = B[i]
+        end
+        KI.barrier()
+
+        a = KI.coopmat_load(MA, sa, 1, 16, Val(false))
+        b = KI.coopmat_load(MB, sb, 1, 16, Val(false))
+        c = KI.coopmat_muladd(a, b, KI.coopmat_zero(MC))
+
+        # Exercise the portable component-wise and component-access floor too:
+        # these are used by fused epilogues and attention rescaling, not merely
+        # conveniences around the WMMA instruction itself.
+        c = KI.coopmat_add(KI.coopmat_mul(c, c), c)
+        for i in Int32(0):(KI.coopmat_length(MC) - Int32(1))
+            c = KI.coopmat_setcomp(c, i, KI.coopmat_getcomp(c, i) + 1f0)
+        end
+        KI.coopmat_store(pointer(C), 1, 16, c, Val(false))
+        return
+    end
+
+    function ki_accumulator_conversion_kernel!(loaded, rounded, half_input, float_input)
+        MH = KI.CoopMatrix{Float16,16,16,KI.Accumulator,KI.SubgroupScope}
+        MF = KI.CoopMatrix{Float32,16,16,KI.Accumulator,KI.SubgroupScope}
+
+        # Fused epilogues use accumulator loads for fp16 bias tiles, then
+        # convert the fp32 product to logical fp16 before applying activation.
+        # Both operations keep a native fp32 WMMA fragment underneath on RDNA.
+        h = KI.coopmat_load(MH, pointer(half_input), 1, 16, Val(false))
+        KI.coopmat_store(pointer(loaded), 1, 16, KI.coopmat_convert(MF, h), Val(false))
+
+        f = KI.coopmat_load(MF, pointer(float_input), 1, 16, Val(false))
+        KI.coopmat_store(pointer(rounded), 1, 16, KI.coopmat_convert(MH, f), Val(false))
+        return
+    end
+
     @testset "WMMA_RDNA3" begin
+        @testset "KernelInterface cooperative-matrix adapter" begin
+            A_host = rand(Float16, 16, 16)
+            B_host = rand(Float16, 16, 16)
+            A, B = ROCArray(A_host), ROCArray(B_host)
+            C = ROCArray(zeros(Float32, 16, 16))
+
+            @roc gridsize=32 groupsize=32 ki_coopmat_kernel!(C, A, B)
+            product = Float32.(A_host) * Float32.(B_host)
+            expected = product .* product .+ product .+ 1f0
+            @test maximum(abs.(Array(C) .- expected)) < 0.01
+
+            half_host = rand(Float16, 16, 16)
+            # Deliberately use values between adjacent fp16 numbers so this
+            # catches a conversion that only relabels the native fp32 handle.
+            float_host = rand(Float32, 16, 16) .* 4f0 .- 2f0
+            half_input = ROCArray(half_host)
+            float_input = ROCArray(float_host)
+            loaded = ROCArray(zeros(Float32, 16, 16))
+            rounded = similar(loaded)
+
+            @roc gridsize=32 groupsize=32 ki_accumulator_conversion_kernel!(
+                loaded, rounded, half_input, float_input)
+            @test Array(loaded) == Float32.(half_host)
+            @test Array(rounded) == Float32.(Float16.(float_host))
+        end
+
         @testset "ColMajor $M×$N: $arg_T -> $res_T" for (M, N, K) in (
             (64, 64, 64), (128, 128, 128),
         ), arg_T in (Float16, BFloat16), res_T in (Float16, BFloat16, Float32)

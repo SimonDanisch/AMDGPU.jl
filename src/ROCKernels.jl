@@ -10,6 +10,7 @@ using AMDGPU: GPUArrays, rocSPARSE, HIP, Device
 import Adapt
 import KernelInterface as KI
 import LLVM
+import Core: LLVMPtr, VecElement
 
 using StaticArraysCore: MArray
 
@@ -150,6 +151,213 @@ end
 @device_override @inline function KI.localmemory(::Type{T}, ::Val{Dims}, ::Val{Id}) where {T, Dims, Id}
     ptr = AMDGPU.Device.alloc_special(Val(Id), T, Val(AMDGPU.AS.Local), Val(prod(Dims)))
     AMDGPU.ROCDeviceArray(Dims, ptr)
+end
+
+# Cooperative matrices -------------------------------------------------------
+#
+# KernelInterface deliberately hides the backend storage parameter of
+# `CoopMatrix`.  On AMDGPU it is the native RDNA3 WMMA register fragment, not
+# Lava's Int32 SPIR-V SSA token.  Keeping the wrapper is important: portable
+# kernels continue to dispatch on MatrixA/MatrixB/Accumulator while the value
+# carried through LLVM is AMDGPU's real register tuple.
+const _WMMA3 = Device.WMMA_RDNA3
+const _WMMA3AB = _WMMA3.Fragment{16,16,Float16,16}
+const _WMMA3C = _WMMA3.Fragment{16,16,Float32,8}
+
+@inline _wmma3_layout(::Val{false}) = _WMMA3.ColMajor
+@inline _wmma3_layout(::Val{true}) = _WMMA3.RowMajor
+@inline _wmma3_ptr(ptr::LLVMPtr{T,A}, offset::Integer) where {T,A} =
+    ptr + Int32(offset - 1) * Int32(sizeof(T))
+@inline _wmma3_scalarptr(
+    ptr::LLVMPtr{NTuple{W,VecElement{Float16}},A},
+) where {W,A} = reinterpret(LLVMPtr{Float16,A}, ptr)
+
+# `@localmem` is a `ROCDeviceArray` around an addrspace(3) pointer.  Keep that
+# wrapper out of the matrix implementation just as Lava keeps its shared-array
+# wrapper out of the SPIR-V lowering: unwrap once, then use the same pointer
+# primitive for local and global memory.
+@device_override @inline KI.coopmat_load(
+    mt::Type{<:KI.CoopMatrix}, src::Device.ROCDeviceArray,
+    offset::Integer, stride::Integer,
+) = KI.coopmat_load(mt, pointer(src), offset, stride)
+
+@device_override @inline KI.coopmat_load(
+    mt::Type{<:KI.CoopMatrix}, src::Device.ROCDeviceArray,
+    offset::Integer, stride::Integer, layout::Val,
+) = KI.coopmat_load(mt, pointer(src), offset, stride, layout)
+
+# The portable staged GEMM vectorises both its global loads and its shared
+# storage.  Its offsets and strides are consequently counted in W-wide shared
+# elements.  RDNA's WMMA loader takes scalar fp16 addresses, so reinterpret the
+# packed storage and convert those two units exactly once at this boundary.
+@device_override @inline KI.coopmat_load(
+    mt::Type{<:KI.CoopMatrix},
+    src::Device.ROCDeviceArray{NTuple{W,VecElement{Float16}},N,A},
+    offset::Integer, stride::Integer,
+) where {W,N,A} = KI.coopmat_load(
+    mt, _wmma3_scalarptr(pointer(src)), 1 + (offset - 1) * W, stride * W)
+
+@device_override @inline KI.coopmat_load(
+    mt::Type{<:KI.CoopMatrix},
+    src::Device.ROCDeviceArray{NTuple{W,VecElement{Float16}},N,A},
+    offset::Integer, stride::Integer, layout::Val,
+) where {W,N,A} = KI.coopmat_load(
+    mt, _wmma3_scalarptr(pointer(src)), 1 + (offset - 1) * W, stride * W, layout)
+
+@device_override @inline KI.coopmat_store(
+    dst::Device.ROCDeviceArray, offset::Integer, stride::Integer,
+    m::KI.CoopMatrix, layout::Val=Val(false),
+) = KI.coopmat_store(pointer(dst), offset, stride, m, layout)
+
+@device_override @inline function KI.coopmat_load(
+    ::Type{KI.CoopMatrix{Float16,16,16,KI.MatrixA,KI.SubgroupScope}},
+    ptr::LLVMPtr{Float16,A}, offset::Integer, stride::Integer,
+    layout::Val{RM}=Val(false),
+) where {A,RM}
+    f = _WMMA3.load_a(_wmma3_ptr(ptr, offset), Int32(stride), _wmma3_layout(layout))
+    return KI.CoopMatrix{Float16,16,16,KI.MatrixA,KI.SubgroupScope}(f)
+end
+
+@device_override @inline function KI.coopmat_load(
+    ::Type{KI.CoopMatrix{Float16,16,16,KI.MatrixB,KI.SubgroupScope}},
+    ptr::LLVMPtr{Float16,A}, offset::Integer, stride::Integer,
+    layout::Val{RM}=Val(false),
+) where {A,RM}
+    f = _WMMA3.load_b(_wmma3_ptr(ptr, offset), Int32(stride), _wmma3_layout(layout))
+    return KI.CoopMatrix{Float16,16,16,KI.MatrixB,KI.SubgroupScope}(f)
+end
+
+@device_override @inline function KI.coopmat_load(
+    ::Type{KI.CoopMatrix{T,16,16,KI.Accumulator,KI.SubgroupScope}},
+    ptr::LLVMPtr{S,A}, offset::Integer, stride::Integer,
+    layout::Val{RM}=Val(false),
+) where {T<:Union{Float16,Float32},S<:Union{Float16,Float32},A,RM}
+    f = _WMMA3.load_c(_wmma3_ptr(ptr, offset), Int32(stride), _wmma3_layout(layout))
+    return KI.CoopMatrix{T,16,16,KI.Accumulator,KI.SubgroupScope}(f)
+end
+
+@device_override @inline function KI.coopmat_store(
+    ptr::LLVMPtr{T,A}, offset::Integer, stride::Integer,
+    m::KI.CoopMatrix{S,16,16,KI.Accumulator,KI.SubgroupScope,_WMMA3C},
+    layout::Val{RM}=Val(false),
+) where {T<:Union{Float16,Float32},A,S,RM}
+    _WMMA3.store_d(_wmma3_ptr(ptr, offset), m.handle, Int32(stride),
+                   _wmma3_layout(layout))
+    return nothing
+end
+
+@device_override @inline function KI.coopmat_muladd(
+    a::KI.CoopMatrix{Float16,16,16,KI.MatrixA,KI.SubgroupScope,_WMMA3AB},
+    b::KI.CoopMatrix{Float16,16,16,KI.MatrixB,KI.SubgroupScope,_WMMA3AB},
+    c::KI.CoopMatrix{Float32,16,16,KI.Accumulator,KI.SubgroupScope,_WMMA3C},
+)
+    f = _WMMA3.mma(a.handle, b.handle, c.handle)
+    return KI.CoopMatrix{Float32,16,16,KI.Accumulator,KI.SubgroupScope}(f)
+end
+
+@device_override @inline function KI.coopmat_mul(
+    a::KI.CoopMatrix{T,16,16,U,KI.SubgroupScope,_WMMA3C},
+    b::KI.CoopMatrix{T,16,16,U,KI.SubgroupScope,_WMMA3C},
+) where {T,U}
+    return KI.CoopMatrix{T,16,16,U,KI.SubgroupScope}(a.handle .* b.handle)
+end
+
+@device_override @inline function KI.coopmat_mul(
+    a::KI.CoopMatrix{Float16,16,16,U,KI.SubgroupScope,_WMMA3AB},
+    b::KI.CoopMatrix{Float16,16,16,U,KI.SubgroupScope,_WMMA3AB},
+) where {U<:Union{KI.MatrixA,KI.MatrixB}}
+    return KI.CoopMatrix{Float16,16,16,U,KI.SubgroupScope}(a.handle .* b.handle)
+end
+
+@device_override @inline function KI.coopmat_add(
+    a::KI.CoopMatrix{T,16,16,U,KI.SubgroupScope,_WMMA3C},
+    b::KI.CoopMatrix{T,16,16,U,KI.SubgroupScope,_WMMA3C},
+) where {T,U}
+    return KI.CoopMatrix{T,16,16,U,KI.SubgroupScope}(a.handle .+ b.handle)
+end
+
+@device_override @inline function KI.coopmat_add(
+    a::KI.CoopMatrix{Float16,16,16,U,KI.SubgroupScope,_WMMA3AB},
+    b::KI.CoopMatrix{Float16,16,16,U,KI.SubgroupScope,_WMMA3AB},
+) where {U<:Union{KI.MatrixA,KI.MatrixB}}
+    return KI.CoopMatrix{Float16,16,16,U,KI.SubgroupScope}(a.handle .+ b.handle)
+end
+
+@inline _wmma3_zero_ab() =
+    _WMMA3AB(ntuple(_ -> VecElement(Float16(0)), Val(16)))
+
+@device_override @inline KI.coopmat_zero(
+    ::Type{KI.CoopMatrix{Float16,16,16,U,KI.SubgroupScope}},
+) where {U<:Union{KI.MatrixA,KI.MatrixB}} =
+    KI.CoopMatrix{Float16,16,16,U,KI.SubgroupScope}(_wmma3_zero_ab())
+
+@device_override @inline KI.coopmat_zero(
+    ::Type{KI.CoopMatrix{Float32,16,16,KI.Accumulator,KI.SubgroupScope}},
+) = KI.CoopMatrix{Float32,16,16,KI.Accumulator,KI.SubgroupScope}(
+        _WMMA3.fill_c(Float32, 0.0f0))
+
+# An undefined fragment has no observable contents before a complete tensor
+# load.  AMDGPU has no Julia-level undef vector value, so use zero; this changes
+# no legal program and avoids manufacturing poison through a tuple constructor.
+@device_override @inline KI.coopmat_undef(
+    ::Type{KI.CoopMatrix{T,16,16,U,KI.SubgroupScope}},
+) where {T,U} = KI.coopmat_zero(KI.CoopMatrix{T,16,16,U,KI.SubgroupScope})
+
+@device_override @inline KI.coopmat_length(
+    ::Type{KI.CoopMatrix{T,16,16,KI.Accumulator,KI.SubgroupScope}},
+) where {T<:Union{Float16,Float32}} = Int32(8)
+
+@device_override @inline KI.coopmat_length(
+    ::Type{KI.CoopMatrix{Float16,16,16,U,KI.SubgroupScope}},
+) where {U<:Union{KI.MatrixA,KI.MatrixB}} = Int32(16)
+
+@device_override @inline KI.coopmat_getcomp(
+    m::KI.CoopMatrix{T,16,16,U,KI.SubgroupScope,_WMMA3C}, i::Int32,
+) where {T,U} = m.handle.data[Int(i) + 1].value
+
+@device_override @inline KI.coopmat_getcomp(
+    m::KI.CoopMatrix{Float16,16,16,U,KI.SubgroupScope,_WMMA3AB}, i::Int32,
+) where {U<:Union{KI.MatrixA,KI.MatrixB}} = m.handle.data[Int(i) + 1].value
+
+@device_override @inline function KI.coopmat_setcomp(
+    m::KI.CoopMatrix{T,16,16,U,KI.SubgroupScope,_WMMA3C}, i::Int32, v::Float32,
+) where {T<:Union{Float16,Float32},U}
+    j = Int(i) + 1
+    data = ntuple(Val(8)) do k
+        # The native accumulator is physically fp32 even when the portable
+        # matrix is logically fp16.  Preserve that representation, but preserve
+        # the portable operation's rounding too: fused GEMM activations run
+        # after the graph's fp32 -> fp16 conversion.
+        x = T === Float16 ? Float32(Float16(v)) : v
+        k == j ? VecElement(x) : m.handle.data[k]
+    end
+    return KI.CoopMatrix{T,16,16,U,KI.SubgroupScope}(_WMMA3C(data))
+end
+
+
+@device_override @inline function KI.coopmat_setcomp(
+    m::KI.CoopMatrix{Float16,16,16,U,KI.SubgroupScope,_WMMA3AB},
+    i::Int32, v::Float16,
+) where {U<:Union{KI.MatrixA,KI.MatrixB}}
+    j = Int(i) + 1
+    data = ntuple(Val(16)) do k
+        k == j ? VecElement(v) : m.handle.data[k]
+    end
+    return KI.CoopMatrix{Float16,16,16,U,KI.SubgroupScope}(_WMMA3AB(data))
+end
+
+@device_override @inline KI.coopmat_convert(
+    ::Type{KI.CoopMatrix{T,16,16,KI.Accumulator,KI.SubgroupScope}},
+    m::KI.CoopMatrix{S,16,16,KI.Accumulator,KI.SubgroupScope,_WMMA3C},
+) where {T<:Union{Float16,Float32},S<:Union{Float16,Float32}} = begin
+    # RDNA stores every accumulator through its fp32 fragment.  A logical fp16
+    # conversion therefore has to round the fragment explicitly; leaving that
+    # until `store_d` is equivalent for identity, but wrong when portable code
+    # applies an activation between `convert` and the store.
+    data = T === Float16 ?
+        ntuple(i -> VecElement(Float32(Float16(m.handle.data[i].value))), Val(8)) :
+        m.handle.data
+    KI.CoopMatrix{T,16,16,KI.Accumulator,KI.SubgroupScope}(_WMMA3C(data))
 end
 
 # Other.
