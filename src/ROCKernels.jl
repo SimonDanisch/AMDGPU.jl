@@ -103,6 +103,7 @@ KI.shfl_down_types(::ROCBackend) = DataType[Bool,
                                              Int8, Int16, Int32, Int64, Int128,
                                              Float16, Float32, Float64,
                                              ComplexF16, ComplexF32, ComplexF64]
+KI.shfl_types(backend::ROCBackend) = KI.shfl_down_types(backend)
 
 # Indexing.
 ## COV_EXCL_START
@@ -372,6 +373,14 @@ end
 
 @device_override function KI.shfl_down(val::T, offset::Integer) where T
     @inline AMDGPU.Device.shfl_down(val, Cint(offset))
+end
+
+# Absolute-lane shuffle is a separate KernelInterface primitive. Portable
+# kernels use it to broadcast lane zero after a `shfl_down` reduction; without
+# this override the globally visible, Float32-specialised Lava method wins
+# Julia dispatch and leaves `_lava_subgroup_shuffle_f32` in the GCN module.
+@device_override function KI.shfl(val::T, lane::Integer) where T
+    @inline AMDGPU.Device.shfl(val, Cint(lane))
 end
 
 @device_override @inline function KI._print(args...)
