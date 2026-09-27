@@ -521,7 +521,7 @@ function pool_free(managed::Managed{M}) where M
 
     try
         time = Base.@elapsed Base.@lock managed.lock begin
-            _pool_free(managed.mem, managed.stream)
+            _pool_free(managed.mem, managed.stream, managed.captured)
         end
         Base.@atomic alloc_stats.free_count += 1
         Base.@atomic alloc_stats.free_bytes += sz
@@ -535,9 +535,11 @@ function pool_free(managed::Managed{M}) where M
     return
 end
 
-function _pool_free(buf, stream::HIPStream)
-    if !HIP.isvalid(stream)
-        stream = AMDGPU.default_stream()
-    end
-    HIP.context!(() -> Mem.free(buf; stream), buf.ctx)
+function _pool_free(buf, stream::HIPStream, captured::Bool)
+    s = HIP.isvalid(stream) ? stream : AMDGPU.default_stream()
+    free() = HIP.context!(() -> Mem.free(buf; stream=s), buf.ctx)
+    # Memory a capture allocated belongs to its graph, and so does its free.
+    # Anything older must not be freed into a graph: see `HIP.outsidecapture`.
+    captured ? free() : HIP.outsidecapture(free)
+    return
 end

@@ -13,6 +13,75 @@ If successful, returns a captured graph that needs to be [`instantiate`](@ref)'d
 """
 capture
 
+# Process state, because stream capture is: `hipStreamCaptureModeGlobal` is about
+# every thread, and the frees this holds back come from finalizers, which have no
+# context object to find it through. A `SpinLock` because a finalizer takes it:
+# it never yields, and holding it disables finalizers on the holding thread.
+struct CaptureGate
+    lock::Threads.SpinLock
+    open::Vector{HIPStream}
+    waiting::Vector{Any}
+end
+
+const CAPTURES = CaptureGate(Threads.SpinLock(), HIPStream[], Any[])
+
+"""
+    outsidecapture(f)
+
+Run `f` where no capture can record it: now if no stream is capturing, otherwise
+when the last open capture closes.
+
+For frees. A capture records whatever is enqueued on its stream, from any thread,
+and that includes a finalizer freeing an array the GC collected while the capture
+was open. The free becomes a `hipGraphNodeTypeMemFree` node of a graph that never
+allocated the memory, and the first launch of that graph segfaults in
+`hipGraphLaunch` after `hsa_amd_vmem_unmap failed`. Holding back every free rather
+than only the capturing stream's also keeps `hipHostFree` and the null stream out
+of a global-mode capture, either of which would invalidate it.
+
+The decision and `f` run under the lock [`begincapture!`](@ref) takes, so a
+capture cannot open between them.
+"""
+function outsidecapture(f)
+    Base.@lock CAPTURES.lock begin
+        isempty(CAPTURES.open) ? f() : push!(CAPTURES.waiting, f)
+    end
+    return
+end
+
+"""End the capture on `stream` and, if it was the last one open, run what waited
+for it. Returns the status and the graph handle, which is only valid on success."""
+function closecapture!(stream::HIPStream)
+    handle_ref = Ref{hipGraph_t}()
+    st = Base.@lock CAPTURES.lock begin
+        st = unchecked_hipStreamEndCapture(stream, handle_ref)
+        i = findfirst(==(stream), CAPTURES.open)
+        i === nothing || deleteat!(CAPTURES.open, i)
+        isempty(CAPTURES.open) && runwaiting!(CAPTURES)
+        st
+    end
+    return st, handle_ref[]
+end
+
+function runwaiting!(g::CaptureGate)
+    fs = copy(g.waiting)
+    empty!(g.waiting)
+    for f in fs
+        try
+            f()
+        catch ex
+            # What waits here was deferred by a finalizer, which is gone, so there
+            # is no caller to throw to. `AMDGPU.pool_free` reports a failed free
+            # the same way.
+            Base.showerror_nostdio(ex,
+                "WARNING: Error in work held back until a stream capture closed")
+            Base.show_backtrace(Core.stdout, catch_backtrace())
+            Core.println()
+        end
+    end
+    return
+end
+
 mutable struct HIPGraph
     handle::hipGraph_t
 
@@ -40,7 +109,10 @@ mutable struct HIPGraph
     """
     global function begincapture!(stream::HIPStream = AMDGPU.stream();
                                   flags = hipStreamCaptureModeGlobal)
-        hipStreamBeginCapture(stream, flags)
+        Base.@lock CAPTURES.lock begin
+            hipStreamBeginCapture(stream, flags)
+            push!(CAPTURES.open, stream)
+        end
         return stream
     end
 
@@ -58,10 +130,9 @@ mutable struct HIPGraph
     to be able to close the capture without a second throw.
     """
     global function endcapture!(stream::HIPStream = AMDGPU.stream())::Union{Nothing, HIPGraph}
-        handle_ref = Ref{hipGraph_t}()
-        st = unchecked_hipStreamEndCapture(stream, handle_ref)
+        st, handle = closecapture!(stream)
         st == hipSuccess || return nothing
-        obj = new(handle_ref[])
+        obj = new(handle)
         finalizer(hipGraphDestroy, obj)
         return obj
     end
@@ -70,11 +141,10 @@ mutable struct HIPGraph
         gc_state = GC.enable(false)
         stream = AMDGPU.stream()
         try
-            hipStreamBeginCapture(stream, flags)
+            begincapture!(stream; flags)
             f()
         finally
-            handle_ref = Ref{hipGraph_t}()
-            st = unchecked_hipStreamEndCapture(stream, handle_ref)
+            st, handle = closecapture!(stream)
             GC.enable(gc_state)
 
             if st == hipErrorStreamCaptureInvalidated && !throw_error
@@ -83,7 +153,7 @@ mutable struct HIPGraph
                 throw(HIPError(st))
             end
 
-            obj = new(handle_ref[])
+            obj = new(handle)
             finalizer(hipGraphDestroy, obj)
             return obj
         end
