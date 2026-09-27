@@ -552,7 +552,12 @@ end
 
 function _pool_free(managed::Managed)
     buf = managed.mem
-    AMDGPU.context!(() -> Mem.free(buf; stream=free_stream(managed)), buf.ctx)
+    stream = free_stream(managed)
+    free() = AMDGPU.context!(() -> Mem.free(buf; stream), buf.ctx)
+    # Memory a capture allocated belongs to its graph, and so does its free.
+    # Anything older must not be freed into a graph: see `HIP.outsidecapture`.
+    managed.captured ? free() : HIP.outsidecapture(free)
+    return
 end
 
 function free_stream(managed::Managed)
