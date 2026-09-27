@@ -105,30 +105,47 @@ KI.shfl_down_types(::ROCBackend) = DataType[Bool,
                                              ComplexF16, ComplexF32, ComplexF64]
 KI.shfl_types(backend::ROCBackend) = KI.shfl_down_types(backend)
 
+# `__ockl_wfred_add`, the wavefront reduction every lane gets the sum of, has these
+# element types.
+const KI_REDUCE_ADD_TYPES = (Int32, UInt32, Int64, UInt64, Float16, Float32, Float64)
+KI.sub_group_reduce_add_types(::ROCBackend) = DataType[KI_REDUCE_ADD_TYPES...]
+
 # Indexing.
 ## COV_EXCL_START
-@device_override @inline function KI.get_local_id()
-    return (; x = Int(AMDGPU.Device.workitemIdx().x), y = Int(AMDGPU.Device.workitemIdx().y), z = Int(AMDGPU.Device.workitemIdx().z))
+# The TYPED queries, which is KernelInterface 0.2's contract: a backend
+# implements `f(::Type{T})` and KI's own zero-argument form forwards to `f(Int)`.
+# These were zero-argument overrides until 2026-09-26, so `get_global_id(Int32)`
+# had no method here and compiled Lava's global SPIR-V method instead, or, once
+# Lava's went into its own table, threw a `MethodError` in the kernel.
+@device_override @inline function KI.get_local_id(::Type{T}) where {T}
+    i = AMDGPU.Device.workitemIdx()
+    return (; x = T(i.x), y = T(i.y), z = T(i.z))
 end
 
-@device_override @inline function KI.get_group_id()
-    return (; x = Int(AMDGPU.Device.workgroupIdx().x), y = Int(AMDGPU.Device.workgroupIdx().y), z = Int(AMDGPU.Device.workgroupIdx().z))
+@device_override @inline function KI.get_group_id(::Type{T}) where {T}
+    g = AMDGPU.Device.workgroupIdx()
+    return (; x = T(g.x), y = T(g.y), z = T(g.z))
 end
 
-@device_override @inline function KI.get_global_id()
-    return (; x = Int((AMDGPU.Device.workgroupIdx().x-1)*AMDGPU.Device.blockDim().x + AMDGPU.Device.workitemIdx().x), y = Int((AMDGPU.Device.workgroupIdx().y-1)*AMDGPU.Device.blockDim().y + AMDGPU.Device.workitemIdx().y), z = Int((AMDGPU.Device.workgroupIdx().z-1)*AMDGPU.Device.blockDim().z + AMDGPU.Device.workitemIdx().z))
+@device_override @inline function KI.get_global_id(::Type{T}) where {T}
+    g, b, i = AMDGPU.Device.workgroupIdx(), AMDGPU.Device.blockDim(), AMDGPU.Device.workitemIdx()
+    return (; x = T((g.x - 1) * b.x + i.x), y = T((g.y - 1) * b.y + i.y),
+              z = T((g.z - 1) * b.z + i.z))
 end
 
-@device_override @inline function KI.get_local_size()
-    return (; x = Int(AMDGPU.Device.workgroupDim().x), y = Int(AMDGPU.Device.workgroupDim().y), z = Int(AMDGPU.Device.workgroupDim().z))
+@device_override @inline function KI.get_local_size(::Type{T}) where {T}
+    d = AMDGPU.Device.workgroupDim()
+    return (; x = T(d.x), y = T(d.y), z = T(d.z))
 end
 
-@device_override @inline function KI.get_num_groups()
-    return (; x = Int(AMDGPU.Device.gridGroupDim().x), y = Int(AMDGPU.Device.gridGroupDim().y), z = Int(AMDGPU.Device.gridGroupDim().z))
+@device_override @inline function KI.get_num_groups(::Type{T}) where {T}
+    d = AMDGPU.Device.gridGroupDim()
+    return (; x = T(d.x), y = T(d.y), z = T(d.z))
 end
 
-@device_override @inline function KI.get_global_size()
-    return (; x = Int(AMDGPU.Device.gridItemDim().x), y = Int(AMDGPU.Device.gridItemDim().y), z = Int(AMDGPU.Device.gridItemDim().z))
+@device_override @inline function KI.get_global_size(::Type{T}) where {T}
+    d = AMDGPU.Device.gridItemDim()
+    return (; x = T(d.x), y = T(d.y), z = T(d.z))
 end
 
 @device_override KI.get_sub_group_size() = UInt32(Device.wavefrontsize())
@@ -374,6 +391,13 @@ end
 @device_override function KI.shfl_down(val::T, offset::Integer) where T
     @inline AMDGPU.Device.shfl_down(val, Cint(offset))
 end
+
+# The hardware reduction, not a `shfl_down` loop: KernelInterface keeps
+# `sub_group_reduce_add` a primitive so a portable kernel gets the instruction.
+# Without it, `Mantle.gemv!`'s reduction compiled Lava's SPIR-V intrinsic into the
+# GCN module and failed as an unknown function.
+@device_override @inline KI.sub_group_reduce_add(val::Union{KI_REDUCE_ADD_TYPES...}) =
+    AMDGPU.Device.wfred(+, val)
 
 # Absolute-lane shuffle is a separate KernelInterface primitive. Portable
 # kernels use it to broadcast lane zero after a `shfl_down` reduction; without
