@@ -55,6 +55,16 @@ KI.supports_subgroups(::ROCBackend) = true
 # `shfl_down` decomposes other types into 32-bit shuffles
 KI.supports_shuffle(::ROCBackend, ::Type{T}) where {T} =
     T <: Union{Bool, Base.BitInteger, Base.IEEEFloat, Complex{<:Union{Base.BitInteger, Base.IEEEFloat}}}
+# `shfl` decomposes like `shfl_down`
+KI.shfl_types(::ROCBackend) = DataType[Bool,
+                                       UInt8, UInt16, UInt32, UInt64, UInt128,
+                                       Int8, Int16, Int32, Int64, Int128,
+                                       Float16, Float32, Float64,
+                                       ComplexF16, ComplexF32, ComplexF64]
+# the element types of `__ockl_wfred_add`, the wavefront reduction every lane gets the
+# sum of
+const REDUCE_ADD_TYPES = (Int32, UInt32, Int64, UInt64, Float16, Float32, Float64)
+KI.sub_group_reduce_add_types(::ROCBackend) = DataType[REDUCE_ADD_TYPES...]
 
 function KI.priority!(::ROCBackend, priority::Symbol)
     priority ∉ (:high, :normal, :low) && error(
@@ -456,6 +466,15 @@ end
 @device_override function KI.shfl_down(val::T, offset::Integer) where T
     @inline Device.shfl_down(val, offset % Cint)
 end
+
+@device_override function KI.shfl(val::T, lane::Integer) where T
+    @inline Device.shfl(val, lane % Cint)
+end
+
+# the hardware reduction rather than a `shfl_down` loop, which is why KernelInterface
+# keeps it a primitive
+@device_override @inline KI.sub_group_reduce_add(val::Union{REDUCE_ADD_TYPES...}) =
+    Device.wfred(+, val)
 
 # not supported, see the `ROCBackend` docstring
 @device_override @inline KI._print(args...) = nothing
